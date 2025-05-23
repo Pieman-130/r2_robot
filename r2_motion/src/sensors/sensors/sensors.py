@@ -4,8 +4,12 @@ from rclpy.node import Node
 import rclpy
 from std_msgs.msg import Float32
 
-PACKET_SIZE = 28 #7 4byte ints
+PAYLOAD_SIZE = 28 #7 4byte ints
 STRUCT_READ = '<7i>' #7 ints little endian
+PREAMBLE = bytes([0xAA,0x55])
+POSTAMBLE = bytes([0x55,0xAA])
+CHECKSUM_SIZE = 1
+PACKET_SIZE = len(PREAMBLE) + PAYLOAD_SIZE + CHECKSUM_SIZE + len(POSTAMBLE) #33 bytes
 
 '''
 Decipher the serial data:
@@ -30,12 +34,21 @@ To convert values:
 
 class SensorRead(Node):
     '''For reading sensors connected via arduino'''
-    def __init__(self):
-        super().__init__('Sensors')
+    def __init__(self,port='/dev/ttyUSB0',data_rate=115200):
+        super().__init__('Arduino_Sensors')
+        try:
+            self.ser = serial.Serial(port, data_rate)
+        except:
+            self.get_logger().error("Failed to connect to Arduino!")
+            rclpy.shutdown()
 
-        self.ser = serial.Serial('/dev/ttyUSB0', 115200)
-
-        #create sensor buffer dict for each of the 7 sensors
+        self.current_sensor_data = {lt_dist_sensor: None,
+                                    rt_dist_sensor: None,
+                                    rr_dist_sensor: None,
+                                    ft_clif_sensor: None,
+                                    rr_clif_sensor: None,
+                                    lt_hall_sensor: None,
+                                    rt_hall_sensor: None}
 
         #TODO Add publishers for each sensor stream
         #3 publishers Speed, Cliff, and Sides
@@ -43,23 +56,41 @@ class SensorRead(Node):
         #self.imu_publisher = self.create_publisher(Imu, 'boat/imu', 10)
         #self.imu_timer = self.create_timer(pub_rate, self.imu_tmr_calbk)
 
+    def _validate_chunk(self,chunk):
+        skip = 2+1+PAYLOAD_SIZE
+        if chunk[0:2] == PREAMBLE and chunk[skip:skip+2] == POSTAMBLE:
+            payload = chunk[2:PAYLOAD_SIZE+2]
+            checksum = chunk[2+PAYLOAD_SIZE]
+            calc_cksum = 0
+            for b in payload:
+                calc_cksum ^= b
+
+            if calc_cksum == checksum:
+                return payload
+            else:
+                self.get_logger().debug("Serial packet data bad checksum.")
+                return False
+        else:
+            return False
+
+
     def read_sensors(self):
         if self.ser.in_waiting >= PACKET_SIZE:
             data = ser.read(PACKET_SIZE)
 
-            rcvd_data = struct.unpack(STRUCT_READ,data)
-
-            print("Data: ", rcvd_data)
-            #TODO don't print, convert to something that can be
-            #parsed for sending out ros messages for each
-            #sensor feed
+            payload = self._validate_chunk(data)
+            if payload:
+                try:
+                    rcvd_data = struct.unpack(STRUCT_READ, payload)
+                except:
+                    self.get_logger().warn("Failed to decode data from arduino sensors.")
 
 
 def main():
 
     rclpy.init()
     sensors = SensorRead()
-    while True:
+    while not rclpy.is_shutdown():
         sensors.read_sensors()
     sensors.destroy_node()
     rclpy.shutdown()
