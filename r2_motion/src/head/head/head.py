@@ -1,4 +1,4 @@
-dimport serial
+import serial
 import struct
 from rclpy.node import Node
 import rclpy
