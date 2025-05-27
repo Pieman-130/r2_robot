@@ -120,8 +120,6 @@ class HeadMotion(Node):
         #determine number of steps to move both servos
         dif_y = int(abs(cy - yd))
         dif_p = int(abs(cp - pd))
-        print(f"Difference in yaw: {dif_y}, current: {cy}, set: {yd}")
-        print(f"Difference in pitch: {dif_p}, current: {cp}, set: {pd}")
         if dif_y > dif_p: #whichever is largest
             steps = dif_y
         else:
@@ -134,13 +132,8 @@ class HeadMotion(Node):
             step_size_p = dif_p/steps
         except ZeroDivisionError:
             step_size_p = 0
-        
-        print(f"Step Size Yaw: {step_size_y} and YD = {yd}")
-        print(f"Step Size Pitch: {step_size_p} and PD = {pd}")
-        print(f"Number of steps aer: {steps}")
 
         for s in range(steps):
-            print(f"CURRENT S is : {s}")
             if cp > pd:
                 #next_pitch = step_size_p*s + cp
                 next_pitch = cp - step_size_p*s
@@ -166,9 +159,6 @@ class HeadMotion(Node):
                 next_yaw = 5.0
             elif next_yaw > 180.0:
                 next_yaw = 180.0
-
-            print(f"Trying to set pitch to: {next_pitch}")
-            print(f"Trying to set yaw to: {next_yaw}")
          
             self.pitch.angle = next_pitch
             self.yaw.angle = next_yaw
@@ -186,7 +176,7 @@ class HeadMotion(Node):
             yaw_rad = 0
             pitch_rad = 0
 
-        self.get_logger().info(f"Current Yaw: {self.yaw.angle}, Current Pitch: {self.pitch.angle}")
+        self.get_logger().debug(f"Current Yaw: {self.yaw.angle}, Current Pitch: {self.pitch.angle}")
 
         #convert euler to quaternion
         cy = math.cos(yaw_rad * 0.5)
