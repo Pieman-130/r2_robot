@@ -1,207 +1,223 @@
-import serial
-import struct
 from rclpy.node import Node
-import rclpy
+from geometry_msgs.msg import Quaternion
 from std_msgs.msg import Float32
+import time
+import rclpy
+import busio
+import math
+from board import SCL,SDA
+from adafruit_motor import servo
+from adafruit_pca9685 import PCA9685
 
-PAYLOAD_SIZE = 28 #7 4byte ints
-STRUCT_READ = '<7i' #7 ints little endian
-PREAMBLE = bytes([0xAA,0x55])
-POSTAMBLE = bytes([0x55,0xAA])
-CHECKSUM_SIZE = 1
-PACKET_SIZE = len(PREAMBLE) + PAYLOAD_SIZE + CHECKSUM_SIZE + len(POSTAMBLE) #33 bytes
+#pwm channel assignments
+YAW = 13 #0-15 16-channel pwm
+PITCH = 12
+
+#servo specific configs
+PWM_LOW = 500 #micro sec
+PWM_HIGH = 2500 #micro sec
+FREQ = 50
+
 PUB_RATE = 0.2 #5Hz
 
-'''
-Decipher the serial data:
-    0 - Left Distance Sensor
-    1 - Right Distance Sensor
-    2 - Rear Distance Sensor
-    3 - Front Cliff Sensor
-    4 - Rear Cliff Sensor
-    5 - Right Hall Sensor
-    6 - Left Hall Sensor
-
-To convert values:
-    Distance:
-        value*0.0343/2/100 = dist in meters
-    Clif:
-        x = value*0.0048828125
-        13*pow(x,-1)/100
-    Hall:
-        RPS = 1/((value/1000000)*90)
-        M/S = dia * pi * RPS
-'''
-
-class SensorRead(Node):
-    '''For reading sensors connected via arduino'''
-    def __init__(self,port='/dev/ttyUSB0',data_rate=115200,pub_rate=PUB_RATE):
-        super().__init__('Arduino_Sensors')
-        try:
-            self.ser = serial.Serial(port, data_rate)
-        except:
-            self.get_logger().error("Failed to connect to Arduino!")
-            rclpy.shutdown()
-
-        self.current_sensor_data = {'lt_dist_sensor': None,
-                                    'rt_dist_sensor': None,
-                                    'rr_dist_sensor': None,
-                                    'ft_clif_sensor': None,
-                                    'rr_clif_sensor': None,
-                                    'lt_hall_sensor': None,
-                                    'rt_hall_sensor': None}
+class HeadMotion(Node):
+    '''Node for moving R2's head'''
+    def __init__(self,pub_rate=PUB_RATE):
+        super().__init__('Head')
+      
+        self.head_pos_publisher = self.create_publisher(
+            Quaternion,
+            'head/position',
+            10)
+    
+        self.head_move_subscriber = self.create_subscription(
+            Quaternion,
+            'head/move_head',
+            self.move_head_callback,
+            10)
         
-        self.ltdist_publisher = self.create_publisher(Float32, 'raw_arduino/leftdistance', 10)
-        self.rtdist_publisher = self.create_publisher(Float32, 'raw_arduino/rightdistance', 10)
-        self.rrdist_publisher = self.create_publisher(Float32, 'raw_arduino/reardistance', 10)
-        self.ftclif_publisher = self.create_publisher(Float32, 'raw_arduino/frontcliff', 10)
-        self.rrclif_publisher = self.create_publisher(Float32, 'raw_arduino/rearcliff', 10)
-        self.ltsped_publisher = self.create_publisher(Float32, 'raw_arduino/leftwheelspeed', 10)
-        self.rtsped_publisher = self.create_publisher(Float32, 'raw_arduino/rightwheelspeed', 10)
+        self.head_speed_subscriber = self.create_subscription(
+            Float32,
+            'head/move_head_speed',
+            self.move_head_speed_callback,
+            10)
+        
+        self.head_pos_timer = self.create_timer(pub_rate, self.pub_head_pos)
 
-        self.read_sensors_timer = self.create_timer(pub_rate/2, self.read_sensors) #reads twice as fast 
-        self.ltdist_timer = self.create_timer(pub_rate, self.lt_dst_calbk)
-        self.rtdist_timer = self.create_timer(pub_rate, self.rt_dst_calbk) 
-        self.rrdist_timer = self.create_timer(pub_rate, self.rr_dst_calbk)
-        self.ftclif_timer = self.create_timer(pub_rate, self.ft_clf_calbk)
-        self.rtclif_timer = self.create_timer(pub_rate, self.rr_clf_calbk)
-        self.ltsped_timer = self.create_timer(pub_rate, self.lt_rpm_calbk)
-        self.rtsped_timer = self.create_timer(pub_rate, self.rt_rpm_calbk)
+        i2c = busio.I2C(SCL,SDA)
+        pca = PCA9685(i2c)
+        pca.frequency = FREQ
+        self.yaw = servo.Servo(pca.channels[YAW], min_pulse=PWM_LOW, max_pulse=PWM_HIGH)
+        self.pitch = servo.Servo(pca.channels[PITCH], min_pulse=PWM_LOW, max_pulse=PWM_HIGH)
 
+        self.move_speed = None
+     
+        self.get_logger().info("Head Motion control starting up.")
+        self.get_logger().info("Moving Head to home position of Pitch 145deg and Yaw 95deg")
+     
+        self._set_servos(145,95,self.pitch.angle,self.yaw.angle,0.025) #home position
 
-    def _validate_chunk(self,chunk):
-        skip = 2+1+PAYLOAD_SIZE
-        if chunk[0:2] == PREAMBLE and chunk[skip:skip+2] == POSTAMBLE:
-            payload = chunk[2:PAYLOAD_SIZE+2]
-            checksum = chunk[2+PAYLOAD_SIZE]
-            calc_cksum = 0
-            for b in payload:
-                calc_cksum ^= b
+    def _convert_quat_to_euler(self,quat):
+        x,y,z,w = quat.x,quat.y,quat.z,quat.w
 
-            if calc_cksum == checksum:
-                return payload
-            else:
-                self.get_logger().debug("Serial packet data bad checksum.")
-                return False
+        yaw_rad = math.atan2(2.0 * (w * z + x * y),
+                             1.0 - 2.0 * (y * y + z * z))
+        
+        sinp = 2.0 * (w * y - z * x)
+        if abs(sinp) >= 1:
+            pitch_rad = math.copysign(math.pi / 2, sinp)
         else:
-            return False
+            pitch_rad = math.asin(sinp)
+
+        pitch_deg = math.degrees(pitch_rad)
+        yaw_deg = math.degrees(yaw_rad)
+
+        self.get_logger().info(f'Pitch: {pitch_deg:.2f}°, Yaw: {yaw_deg:.2f}°')
+
+        return pitch_deg, yaw_deg
 
 
-    def read_sensors(self):
-        if self.ser.in_waiting >= PACKET_SIZE:
-            data = self.ser.read(PACKET_SIZE)
-
-            payload = self._validate_chunk(data)
-            if payload:
-                try:
-                    rcvd_data = struct.unpack(STRUCT_READ, payload)
-                    self.current_sensor_data = {
-                                'lt_dist_sensor': rcvd_data[0],
-                                'rt_dist_sensor': rcvd_data[1],
-                                'rr_dist_sensor': rcvd_data[2],
-                                'ft_clif_sensor': rcvd_data[3],
-                                'rr_clif_sensor': rcvd_data[4],
-                                'rt_hall_sensor': rcvd_data[5],
-                                'lt_hall_sensor': rcvd_data[6]
-                                }
-                except:
-                    self.get_logger().warn("Failed to decode data from arduino sensors.")
+    def move_head_speed_callback(self,msg):
+        self.move_speed = -1*msg.data+1 #sets delay for how long to take to move
+        #higher numbers are slower speeds
 
 
-    def lt_dst_calbk(self):
-        msg = Float32()
-        data = self.current_sensor_data['lt_dist_sensor']
+    def move_head_callback(self, msg):
+        pd, yd = self._convert_quat_to_euler(msg)
 
-        if data: #none signifies nothing received yet
-            distance = data*0.0343/2/100 #distance in meters
-            msg.data = distance
-            self.ltdist_publisher.publish(msg)
-            self.get_logger().debug(f"Published Left Distance: {distance} meters")
+        #read current state
+        current_yaw = self.yaw.angle
+        current_pitch = self.pitch.angle
+     
+        #get requested speed
+        if self.move_speed:
+            delay = self.move_speed
+        else: #if not set
+            delay = 0.025 #good marginal speed
+
+        self._set_servos(pd,
+                         yd,
+                         current_pitch,
+                         current_yaw,
+                         delay)
+
     
-    
-    def rt_dst_calbk(self):
-        msg = Float32()
-        data = self.current_sensor_data['rt_dist_sensor']
+    def _set_servos(self,pd,yd,cp,cy,delay):
+        '''set the servo values so they move together
+        in a sort-of-smooth motion'''
+        #correct for small neg values
+        if cp: #None is not set yet
+            if cp < 0:
+                cp = 0
+        else:
+            cp = 0
+        if cy: #None is not set yet
+            if cy < 0:
+                cy = 0
+        else:
+            cy = 0
 
-        if data: #none signifies nothing received yet
-            distance = data*0.0343/2/100 #distance in meters
-            msg.data = distance
-            self.rtdist_publisher.publish(msg)
-            self.get_logger().debug(f"Published Right Distance: {distance} meters")
+        #determine number of steps to move both servos
+        dif_y = int(abs(cy - yd))
+        dif_p = int(abs(cp - pd))
+        print(f"Difference in yaw: {dif_y}, current: {cy}, set: {yd}")
+        print(f"Difference in pitch: {dif_p}, current: {cp}, set: {pd}")
+        if dif_y > dif_p: #whichever is largest
+            steps = dif_y
+        else:
+            steps = dif_p
+        try:
+            step_size_y = dif_y/steps #step size dependent for each servo
+        except ZeroDivisionError:
+            step_size_y = 0
+        try:
+            step_size_p = dif_p/steps
+        except ZeroDivisionError:
+            step_size_p = 0
+        
+        print(f"Step Size Yaw: {step_size_y} and YD = {yd}")
+        print(f"Step Size Pitch: {step_size_p} and PD = {pd}")
+        print(f"Number of steps aer: {steps}")
 
-
-    def rr_dst_calbk(self):
-        msg = Float32()
-        data = self.current_sensor_data['rr_dist_sensor']
-
-        if data: #none signifies nothing received yet
-            distance = data*0.0343/2/100 #distance in meters
-            msg.data = distance
-            self.rrdist_publisher.publish(msg)
-            self.get_logger().debug(f"Published Rear Distance: {distance} meters")
-
-
-    def ft_clf_calbk(self):
-        msg = Float32()
-        data = self.current_sensor_data['ft_clif_sensor']
-
-        if data:
-            x = data*0.0048828125
-            distance=13*pow(x,-1)/100
-            msg.data = distance
-            self.ftclif_publisher.publish(msg)
-            self.get_logger().debug(f"Published Front Cliff Distance: {distance} meters")
-
-    def rr_clf_calbk(self):
-        msg = Float32()
-        data = self.current_sensor_data['rr_clif_sensor']
-
-        if data:
-            x = data*0.0048828125
-            distance=13*pow(x,-1)/100
-            msg.data = distance
-            self.rrclif_publisher.publish(msg)
-            self.get_logger().debug(f"Published Rear Cliff Distance: {distance} meters")
-    
-
-    def lt_rpm_calbk(self):
-        msg = Float32()
-        data = self.current_sensor_data['lt_hall_sensor']
-
-        if data or data == 0.0:
-            if data > 0.0:
-                rpm = 1/((data/1000000)*90)*60
+        for s in range(steps):
+            print(f"CURRENT S is : {s}")
+            if cp > pd:
+                #next_pitch = step_size_p*s + cp
+                next_pitch = cp - step_size_p*s
+            else:     
+                next_pitch = step_size_p*s + cp 
+                #next_pitch = cp - step_size_p*s
+            
+            #set pitch limits
+            if next_pitch < 100.0:
+                next_pitch = 100.0
+            elif next_pitch > 180.0:
+                next_pitch = 180.0
+            
+            if cy > yd:
+                #next_yaw = step_size_y*s + cy
+                next_yaw = cy - step_size_y*s
             else:
-                rpm = 0.0
-            msg.data = rpm
-            self.ltsped_publisher.publish(msg)
-            self.get_logger().debug(f"Published Left Wheel Speed: {rpm} RPM") 
+                next_yaw = step_size_y*s + cy
+                #next_yaw = cy - step_size_y*s
 
+            #set yaw limits
+            if next_yaw < 5.0:
+                next_yaw = 5.0
+            elif next_yaw > 180.0:
+                next_yaw = 180.0
 
-    def rt_rpm_calbk(self):
-        msg = Float32()
-        data = self.current_sensor_data['rt_hall_sensor']
+            print(f"Trying to set pitch to: {next_pitch}")
+            print(f"Trying to set yaw to: {next_yaw}")
+         
+            self.pitch.angle = next_pitch
+            self.yaw.angle = next_yaw
+            time.sleep(delay) #slows motion to make it more fluid
 
-        if data or data == 0.0:
-            if data > 0.0:
-                rpm = 1/((data/1000000)*90)*60
-            else:
-                rpm = 0.0
-            msg.data = rpm
-            self.rtsped_publisher.publish(msg)
-            self.get_logger().debug(f"Published Right Wheel Speed: {rpm} RPM")
+ 
+    def pub_head_pos(self):
 
+        msg = Quaternion()
+
+        try:
+            yaw_rad = self.yaw.angle*math.pi/180
+            pitch_rad = self.pitch.angle*math.pi/180
+        except TypeError: #Can be none if it was never set before
+            yaw_rad = 0
+            pitch_rad = 0
+
+        self.get_logger().info(f"Current Yaw: {self.yaw.angle}, Current Pitch: {self.pitch.angle}")
+
+        #convert euler to quaternion
+        cy = math.cos(yaw_rad * 0.5)
+        sy = math.sin(yaw_rad * 0.5)
+        cp = math.cos(pitch_rad * 0.5)
+        sp = math.sin(pitch_rad * 0.5)
+        cr = math.cos(0 * 0.5) #no roll
+        sr = math.sin(0 * 0.5) #no roll
+
+        msg.w = cy * cp * cr + sy * sp * sr
+        msg.x = cy * cp * sr - sy * sp * cr
+        msg.y = sy * cp * sr + cy * sp * cr
+        msg.z = sy * cp * cr - cy * sp * sr
+
+        self.head_pos_publisher.publish(msg)
+        self.get_logger().debug(f"Published Head Position: ({msg.w},{msg.x},{msg.y},{msg.z})")
+    
 
 def main():
 
     rclpy.init()
-    sensors = SensorRead()
-    rclpy.spin(sensors)
-    sensors.destroy_node()
+    head = HeadMotion()
+    rclpy.spin(head)
     rclpy.shutdown()
 
 
-if __name__ == '__main__':
+if __name__=='__main__':
     main()
+
+
+
+
 
 
